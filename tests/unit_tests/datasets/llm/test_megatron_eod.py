@@ -22,10 +22,16 @@ config threading of ``reset_position_ids`` / ``reset_attention_mask`` /
 
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
 import torch
 
 from nemo_automodel.components.datasets.llm import megatron_dataset
-from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import _get_ltor_masks_and_position_ids
+from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import (
+    GPTDataset,
+    GPTDatasetConfig,
+    _get_ltor_masks_and_position_ids,
+)
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining, MegatronPretrainingConfig
 
 EOD = 99
@@ -157,3 +163,60 @@ class TestEodConfigThreading:
         assert captured["reset_position_ids"] is True
         assert captured["reset_attention_mask"] is True
         assert captured["eod_mask_loss"] is True
+
+
+class TestGetItemDocumentBoundaryOutput:
+    """__getitem__ must surface the newly enabled features in the sample dict."""
+
+    def _dataset(self, **flags):
+        ds = GPTDataset.__new__(GPTDataset)
+        text = np.array([5, EOD, 7, 8, EOD, 9], dtype=np.int64)
+        ds._query_document_sample_shuffle_indices = lambda idx: (text, None)  # noqa: E731
+        ds.config = SimpleNamespace(
+            add_extra_token_to_sequence=True,
+            reset_position_ids=flags.get("reset_position_ids", False),
+            reset_attention_mask=flags.get("reset_attention_mask", False),
+            eod_mask_loss=flags.get("eod_mask_loss", False),
+            create_attention_mask=flags.get("create_attention_mask", False),
+        )
+        ds._pad_token_id = 0
+        ds._eos_token_id = EOD
+        ds._eod_token_id = EOD
+        ds.masks_and_position_ids_are_cacheable = False
+        ds.masks_and_position_ids_are_cached = False
+        return ds
+
+    def test_position_ids_returned_when_reset_enabled(self):
+        sample = self._dataset(reset_position_ids=True)[0]
+        assert "position_ids" in sample
+        # tokens are [5, EOD, 7, 8, EOD]: positions restart after each EOD.
+        assert sample["position_ids"].tolist() == [0, 1, 0, 1, 2]
+
+    def test_position_ids_absent_when_reset_disabled(self):
+        sample = self._dataset()[0]
+        assert "position_ids" not in sample
+
+    def test_eod_mask_loss_encodes_ignore_index_in_labels(self):
+        sample = self._dataset(eod_mask_loss=True)[0]
+        assert sample["loss_mask"].tolist() == [1.0, 0.0, 1.0, 1.0, 0.0]
+        # The helper masks loss_mask at input-EOD positions (1, 4), matching
+        # Megatron semantics. Those label positions must not contribute to the
+        # CE loss or to _count_label_tokens normalization, which both key off
+        # -100.
+        assert sample["labels"].tolist() == [EOD, -100, 8, EOD, -100]
+
+    def test_labels_untouched_when_eod_mask_loss_disabled(self):
+        sample = self._dataset()[0]
+        assert sample["labels"].tolist() == [EOD, 7, 8, EOD, 9]
+
+    def test_reset_attention_mask_requires_create_attention_mask(self):
+        with pytest.raises(ValueError, match="create_attention_mask"):
+            GPTDatasetConfig(
+                random_seed=0,
+                sequence_length=8,
+                tokenizer=SimpleNamespace(eos_token_id=EOD, pad_token_id=0),
+                reset_position_ids=False,
+                reset_attention_mask=True,
+                eod_mask_loss=False,
+                create_attention_mask=False,
+            )
